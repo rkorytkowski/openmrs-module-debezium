@@ -17,8 +17,8 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 
-@Component("debezium.DebeziumSetup")
-public class DebeziumSetup implements SmartInitializingSingleton {
+@Component("debezium.DebeziumInitializer")
+public class DebeziumInitializer implements SmartInitializingSingleton {
 	
 	private final SchedulerService schedulerService;
 	
@@ -26,7 +26,7 @@ public class DebeziumSetup implements SmartInitializingSingleton {
 	
 	public static final String EMBEDDED_DEBEZIUM_TASK_UUID = "ca2b67c5-5544-4be0-94be-4af7e55b84c6";
 	
-	public DebeziumSetup(SchedulerService schedulerService) {
+	public DebeziumInitializer(SchedulerService schedulerService) {
 		this.schedulerService = schedulerService;
 	}
 	
@@ -39,9 +39,9 @@ public class DebeziumSetup implements SmartInitializingSingleton {
 			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
 			// Scheduled recurrently, but it should be running indefinitely if no errors occur.
 			// If an error occurs, the task is retried 3 times within a few seconds and if it is still failing, it gets
-			// re-scheduled after a minute.
-			schedulerService.scheduleRecurrently(EMBEDDED_DEBEZIUM_TASK_UUID, new DebeziumTaskData(), Duration.ofMinutes(1),
-			    EMBEDDED_DEBEZIUM_TASK);
+			// re-scheduled after 30 seconds.
+			schedulerService.scheduleRecurrently(EMBEDDED_DEBEZIUM_TASK_UUID, new DebeziumTaskData(),
+			    Duration.ofSeconds(30), EMBEDDED_DEBEZIUM_TASK);
 		}
 		finally {
 			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);

@@ -32,6 +32,7 @@ import org.openmrs.scheduler.TaskHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
@@ -42,10 +43,10 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
 
-@Component("debezium.DebeziumEngineManager")
-public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
+@Component("debezium.DebeziumTask")
+public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	
-	private static final Logger log = LoggerFactory.getLogger(DebeziumEngineManager.class);
+	private static final Logger log = LoggerFactory.getLogger(DebeziumTask.class);
 	
 	private static final ObjectMapper objectMapper = new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 	
@@ -56,10 +57,13 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 	
 	@Autowired(required = false)
 	private SessionFactory sessionFactory;
+
+	@Autowired
+	Environment env;
 	
 	private final Map<String, Class<?>> tableToEntityClassMap = new HashMap<>();
 	
-	public DebeziumEngineManager() {
+	public DebeziumTask() {
 	}
 	
 	@PreDestroy
@@ -94,14 +98,14 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 		}
 	}
 	
-	private Class<?> getEntityClassByTableName(String tableName) {
+	public Class<?> getEntityClassByTableName(String tableName) {
 		if (tableName == null) {
 			return null;
 		}
 		return tableToEntityClassMap.get(tableName.toLowerCase());
 	}
 	
-	private void handleEvent(ChangeEvent<String, String> event) {
+	public void handleEvent(ChangeEvent<String, String> event) {
 		if (event.value() != null) {
 			String destination = event.destination();
 			String key = event.key();
@@ -136,8 +140,14 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 						}
 						return;
 					}
+
+					// 3. Check for schema change event and ignore
+					if (payload.has("ddl")) {
+						log.debug("Schema Change Event detected and ignored. DDL: {}", payload.path("ddl").asText());
+						return;
+					}
 					
-					// 2. Handle Standard Data Events
+					// 4. Handle Standard Data Events
 					String op = payload.path("op").asText();
 					JsonNode before = payload.path("before");
 					JsonNode after = payload.path("after");
@@ -226,7 +236,13 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 		Properties runtimeProperties = Context.getRuntimeProperties();
 		String dbUrl = runtimeProperties.getProperty("connection.url");
 		String dbUsername = runtimeProperties.getProperty("debezium.database.user");
+		if (dbUsername == null) {
+			dbUsername = runtimeProperties.getProperty("connection.username");
+		}
 		String dbPassword = runtimeProperties.getProperty("debezium.database.password");
+		if (dbPassword == null) {
+			dbPassword = runtimeProperties.getProperty("connection.password");
+		}
 		String connectorClass;
 		if (dbUrl.startsWith("jdbc:mysql:")) {
 			connectorClass = "io.debezium.connector.mysql.MySqlConnector";
@@ -270,10 +286,10 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 		        
 		        // JDBC Offset Storage
 		        .with("offset.storage", "io.debezium.storage.jdbc.offset.JdbcOffsetBackingStore")
-		        .with("offset.storage.jdbc.offset.table.name", "debezium_offset_storage")
-		        .with("offset.storage.jdbc.url", dbUrl)
-		        .with("offset.storage.jdbc.user", dbUsername)
-		        .with("offset.storage.jdbc.password", dbPassword)
+		        .with("offset.storage.jdbc.table.name", "debezium_offset_storage")
+		        .with("offset.storage.jdbc.connection.url", dbUrl)
+		        .with("offset.storage.jdbc.connection.user", dbUsername)
+		        .with("offset.storage.jdbc.connection.password", dbPassword)
 		        .with("offset.flush.interval.ms", "60000")
 		        
 		        // Database connection properties
@@ -290,9 +306,9 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 		        // JDBC Database Schema History
 		        .with("schema.history.internal", "io.debezium.storage.jdbc.history.JdbcSchemaHistory")
 		        .with("schema.history.internal.jdbc.table.name", "debezium_database_history")
-		        .with("schema.history.internal.jdbc.url", dbUrl)
-		        .with("schema.history.internal.jdbc.user", dbUsername)
-		        .with("schema.history.internal.jdbc.password", dbPassword)
+		        .with("schema.history.internal.jdbc.connection.url", dbUrl)
+		        .with("schema.history.internal.jdbc.connection.user", dbUsername)
+		        .with("schema.history.internal.jdbc.connection.password", dbPassword)
 		        // Fixes java.sql.SQLSyntaxErrorException: (conn=4005) Column length too big for column 'history_data' (max = 16383); use BLOB or TEXT instead
 		        .with(
 		            "schema.history.internal.jdbc.table.ddl",
@@ -307,6 +323,7 @@ public class DebeziumEngineManager implements TaskHandler<DebeziumTaskData> {
 				properties.put(debeziumKey, runtimeProperties.getProperty(key));
 			}
 		}
+
 		return properties;
 	}
 }
