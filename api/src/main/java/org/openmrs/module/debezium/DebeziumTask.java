@@ -154,14 +154,21 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 					String txId = payload.path("source").path("txId").asText(null);
 					String table = payload.path("source").path("table").asText(null);
 					
+					String snapshot = null;
+					JsonNode snapshotNode = payload.path("source").path("snapshot");
+					if (!snapshotNode.isMissingNode() && !snapshotNode.isNull()) {
+						snapshot = snapshotNode.asText();
+					}
+
 					Class<?> entityClass = getEntityClassByTableName(table);
-					log.debug("Parsed Event -> Operation: {}, Transaction ID: {}, Table: {}, Entity: {}, Before: {}, After: {}", op, txId, table, entityClass, before,
+					log.debug("Parsed Event -> Operation: {}, Transaction ID: {}, Table: {}, Entity: {}, Snapshot: {}, Before: {}, After: {}", op, txId, table, entityClass, snapshot, before,
 					    after);
 					@SuppressWarnings("unchecked")
 					CDCEvent<Object> cdcEvent = new CDCEvent<>((Class<Object>) entityClass);
 					cdcEvent.setOperation(getOperation(op));
 					cdcEvent.setTransactionId(txId);
 					cdcEvent.setTableName(table);
+					cdcEvent.setSnapshot(snapshot);
 					Map<String, Object> primaryKey = (keyPayload == null || keyPayload.isMissingNode() || keyPayload.isNull()) ? null
 							: objectMapper.convertValue(keyPayload, new TypeReference<Map<String, Object>>() {});
 					cdcEvent.setPrimaryKey(primaryKey);
@@ -198,6 +205,9 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 				break;
 			case "d":
 				operation = CDCEvent.Operation.DELETE;
+				break;
+			case "t":
+				operation = CDCEvent.Operation.TRUNCATE;
 				break;
 
 		}
