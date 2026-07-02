@@ -30,6 +30,7 @@ import java.util.Properties;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 @SkipBaseSetup
 public class DebeziumTaskIntegrationTest extends BaseContextSensitiveNonTransactionalTest {
@@ -111,6 +112,8 @@ public class DebeziumTaskIntegrationTest extends BaseContextSensitiveNonTransact
 		assertEquals(PersonName.class, capturedEvent.getEntityType());
 		assertEquals("person_name", capturedEvent.getTableName());
 		assertEquals(personName.getPersonNameId(), capturedEvent.getPrimaryKey().get("person_name_id"));
+		assertNotNull(capturedEvent.getTransactionId());
+		assertTrue(!capturedEvent.getTransactionId().isBlank());
 		
 		Map<String, Object> newState = capturedEvent.getNewState();
 		assertNotNull(newState);

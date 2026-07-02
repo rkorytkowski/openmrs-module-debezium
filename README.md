@@ -3,7 +3,7 @@ Debezium Module
 
 Description
 -----------
-Runs embedded Debezium that connects to database and publishes CDC events on each DB operation.
+Runs an embedded Debezium engine that connects to the OpenMRS database and publishes in-process CDC events on each DB operation.
 
 It issues a CDCEvent for each read, create, update, delete of a DB row and CDCTransactionStartedEvent/CompletedEvent
 upon starting and successfully completing a transaction.
@@ -13,11 +13,13 @@ aggregated.
 
 Embedded Debezium runs as a recurring scheduled task in OpenMRS. It runs indefinitely if no errors
 occur. If anything fails the task is re-started within a few seconds to resume publishing events
-from the last failed event. If the error persists the task gets re-scheduled after a minute unitl error is fixed.
+from the last failed event. If the error persists the task gets re-scheduled after 30 seconds until the error is fixed.
 
-No further events are published until issue is resolved to guarantee consistency.
+By default the same malformed event is retried three times. If it still fails, the event is parked in
+the `debezium_failed_events` table and later events continue to be published. Set
+`debezium.module.failed.event.max.retries=0` to park immediately, or raise the value to keep retrying longer.
 
-Multiple replicas of OpenMRS are supported with only one replica running Debezium at a time. 
+Multiple replicas of OpenMRS are supported with only one replica running Debezium at a time.
 Application events are only published on a replica that runs Debezium. If a replica with Debezium
 fails, the Debezium task is scheduled on another replica.
 
@@ -30,26 +32,29 @@ The module requires OpenMRS Core 2.9+ and Java 17.
 
 Listening to events
 -----------
-Since events are published from a scheduled task, they are asynchronous to the application logic by default. 
+Since events are published from a scheduled task, they are asynchronous to the application logic by default.
 You must not use `@TransactionalEventListener` to listen to CDC events.
 
 `@EventListener` and `@OutboxEventListener` are fully supported. It is recommended to use
 `@EventListener` for fast listeners that run in the same thread as the Debezium task, thus any failure
 leads to the task failure and triggers re-try logic.
 
-Alternatively for slow running listeners you may use `@OutboxEventListener` to have the CDC event 
+Alternatively for slow running listeners you may use `@OutboxEventListener` to have the CDC event
 persisted in the DB upon publishing and have a slow running listener being executed asynchronously by the Outbox engine.
 This way the event is guaranteed to be processed asynchronously even if anything fails as opposed to `@EventListener`
-annotated with `@Async`, which may lead to loosing an event when anything fails.
+annotated with `@Async`, which may lead to losing an event when anything fails.
 
-Please note that `@OutboxEventListener` serializes each event to JSON and persist it in DB, which introduces
+Please note that `@OutboxEventListener` serializes each event to JSON and persists it in DB, which introduces
 performance overhead and latency, thus consider it carefully over synchronous `@EventListener`.
+
+This module only runs the embedded Debezium engine and publishes `CDCEvent`s inside OpenMRS. Forwarding
+those events to an external broker should be implemented by a listener in another module or service.
 
 Running the module
 -----------
 
 For Debezium to work, you need to enable binlog on your DB instance by specifying
-`server-id`, `log-bin`, `binglog-format` and `binlog-row-image` command line arguments. For
+`server-id`, `log-bin`, `binlog-format` and `binlog-row-image` command line arguments. For
 a standard docker compose installation the command would be as follows:
 ```
     db:
@@ -83,7 +88,7 @@ GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *
 GRANT BINLOG MONITOR ON *.* TO 'debezium'@'%';
 GRANT BINLOG MONITOR ON *.* TO 'debezium'@'localhost';
 
--- Grant privileges on the openmrs database to read data and write offset/history tables
+-- Grant privileges on the OpenMRS database to read data and write offset/history tables
 GRANT ALL PRIVILEGES ON openmrs.* TO 'debezium'@'%';
 GRANT ALL PRIVILEGES ON openmrs.* TO 'debezium'@'localhost';
 
@@ -91,7 +96,7 @@ GRANT ALL PRIVILEGES ON openmrs.* TO 'debezium'@'localhost';
 FLUSH PRIVILEGES;
 ```
 
-Finally specify `debezium.database.user=debezium` and `debezium.database.password=Debezium1234` runtime properties.
+Finally specify `debezium.database.user=debezium` and `debezium.database.password=...` runtime properties.
 For a standard docker compose setup it would be as follows:
 ```
 api:
@@ -100,10 +105,16 @@ api:
         OMRS_EXTRA_DEBEZIUM_DATABASE_PASSWORD: Debezium1234
 ```
 
+`database.include.list` is derived from `connection.url` by default, and any `debezium.*` runtime property
+still overrides the generated Debezium configuration when needed.
+
+At debug level, the module logs event metadata only. Full key and row contents are logged at trace level to
+avoid leaking patient data into routine debug logs.
+
 Building from Source
 --------------------
-You will need to have Java 17+ and Maven 2.x+ installed.  Use the command 'mvn package' to 
-compile and package the module.  The .omod file will be in the omod/target folder.
+You will need to have Java 17+ and Maven 2.x+ installed. Use the command `mvn package` to
+compile and package the module. The `.omod` file will be in the `omod/target` folder.
 
 Installation
 ------------
@@ -111,6 +122,6 @@ Installation
 2. Use the OpenMRS Administration > Manage Modules screen to upload and install the .omod file.
 
 If uploads are not allowed from the web (changeable via a runtime property), you can drop the omod
-into the ~/.OpenMRS/modules folder.  (Where ~/.OpenMRS is assumed to be the Application 
-Data Directory that the running openmrs is currently using.)  After putting the file in there 
+into the `~/.OpenMRS/modules` folder. (Where `~/.OpenMRS` is assumed to be the Application
+Data Directory that the running openmrs is currently using.) After putting the file in there
 simply restart OpenMRS/tomcat and the module will be loaded and started.

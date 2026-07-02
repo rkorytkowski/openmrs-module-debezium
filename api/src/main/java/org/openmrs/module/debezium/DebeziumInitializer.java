@@ -32,9 +32,11 @@ public class DebeziumInitializer implements SmartInitializingSingleton {
 	
 	@Override
 	public void afterSingletonsInstantiated() {
+		boolean sessionOpened = false;
 		try {
 			if (!Context.isSessionOpen()) {
 				Context.openSession();
+				sessionOpened = true;
 			}
 			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
 			// Scheduled recurrently, but it should be running indefinitely if no errors occur.
@@ -45,6 +47,9 @@ public class DebeziumInitializer implements SmartInitializingSingleton {
 		}
 		finally {
 			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
+			if (sessionOpened) {
+				Context.closeSession();
+			}
 		}
 	}
 }
