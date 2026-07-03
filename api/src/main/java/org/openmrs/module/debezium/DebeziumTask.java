@@ -163,24 +163,27 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 				} else if ("END".equals(status)) {
 					eventPublisher.publishEvent(new CDCTransactionCompletedEvent(txId));
 				}
+				clearFailedEventTracking(event);
 				return;
 			}
 
 			if (payload.has("ddl")) {
 				log.debug("Schema Change Event detected and ignored. DDL: {}", payload.path("ddl").asText());
+				clearFailedEventTracking(event);
 				return;
 			}
 
 			if (isHeartbeatEvent(payload)) {
 				log.trace("Heartbeat event detected and ignored for destination [{}]", destination);
+				clearFailedEventTracking(event);
 				return;
 			}
-			
+
 			String op = payload.path("op").asText(null);
 			if (op == null || op.isBlank()) {
 				throw new IllegalArgumentException("Missing CDC operation for destination [" + destination + "]");
 			}
-			
+
 			JsonNode before = payload.path("before");
 			JsonNode after = payload.path("after");
 			String txId = payload.path("transaction").path("id").asText(null);
@@ -193,11 +196,11 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 			if (!snapshotNode.isMissingNode() && !snapshotNode.isNull()) {
 				snapshot = snapshotNode.asText();
 			}
-			
+
 			Class<?> entityClass = getEntityClassByTableName(table);
 			log.debug("Parsed Event -> Operation: {}, Transaction ID: {}, Table: {}, Entity: {}, Snapshot: {}", op, txId, table, entityClass, snapshot);
 			log.trace("Parsed Event States -> Before: {}, After: {}", before, after);
-			
+
 			@SuppressWarnings("unchecked")
 			CDCEvent<Object> cdcEvent = new CDCEvent<>((Class<Object>) entityClass);
 			cdcEvent.setOperation(getOperation(op));
@@ -208,6 +211,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 			cdcEvent.setPreviousState(toMap(before));
 			cdcEvent.setNewState(toMap(after));
 			eventPublisher.publishEvent(cdcEvent);
+			clearFailedEventTracking(event);
 		}
 		catch (Exception e) {
 			handleEventFailure(event, key, e);
@@ -455,11 +459,10 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	
 	private synchronized void refreshTableToEntityClassMap() {
 		tableToEntityClassMap.clear();
-		unknownTables.clear();
 		if (sessionFactory == null) {
 			return;
 		}
-		
+
 		try {
 			SessionFactoryImplementor sessionFactoryImplementor = sessionFactory.unwrap(SessionFactoryImplementor.class);
 			for (EntityPersister persister : sessionFactoryImplementor.getMetamodel().entityPersisters().values()) {
@@ -477,6 +480,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		catch (Exception e) {
 			log.warn("Failed to extract table mappings from SessionFactory", e);
 		}
+		unknownTables.removeAll(tableToEntityClassMap.keySet());
 	}
 	
 	private static @Nullable String cleanTableName(@Nullable String tableName) {
@@ -537,15 +541,22 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	}
 	
 	private void handleEventFailure(ChangeEvent<String, String> event, @Nullable String key, Exception error) {
-		int attempts = registerFailedEventAttempt(event);
+		String fingerprint = extractStableFingerprint(event);
+		int attempts = failedEventAttempts.merge(fingerprint, 1, Integer::sum);
 		if (attempts > getFailedEventMaxRetries()) {
 			parkFailedEvent(event, attempts, error);
-			failedEventAttempts.remove(extractStableFingerprint(event));
+			failedEventAttempts.remove(fingerprint);
 			log.error("Parked CDC event for destination [{}] after {} failed attempts. Processing continues from the next event.", event.destination(), attempts, error);
 			return;
 		}
 
-		throw new DebeziumException("Failed to parse and process CDC event for key [" + key + "]. Value: " + event.value(), error);
+		throw new DebeziumException("Failed to parse and process CDC event for destination [" + event.destination() + "]", error);
+	}
+
+	private void clearFailedEventTracking(ChangeEvent<String, String> event) {
+		if (!failedEventAttempts.isEmpty()) {
+			failedEventAttempts.remove(extractStableFingerprint(event));
+		}
 	}
 	
 	private void startLivenessMonitor(Properties debeziumConfig) {
