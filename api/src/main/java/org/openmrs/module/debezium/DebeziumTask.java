@@ -235,7 +235,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		
 		AtomicReference<Throwable> engineError = new AtomicReference<>();
 		Properties debeziumConfig = getDebeziumConfig();
-		lastEngineActivityTimestamp.set(System.currentTimeMillis());
+		lastEngineActivityTimestamp.set(0L);
 		startLivenessMonitor(debeziumConfig);
 		
 		try {
