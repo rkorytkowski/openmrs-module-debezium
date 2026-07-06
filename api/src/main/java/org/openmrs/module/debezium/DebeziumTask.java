@@ -46,6 +46,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -88,10 +89,10 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	private final AtomicLong lastEngineActivityTimestamp = new AtomicLong(0L);
 	
 	private volatile @Nullable ScheduledExecutorService livenessMonitor;
-	
-	private volatile @Nullable String lastFailedEventFingerprint;
-	
-	private volatile int lastFailedEventAttempts;
+
+	private final Map<String, Integer> failedEventAttempts = new ConcurrentHashMap<>();
+
+	private final Set<String> unknownTables = ConcurrentHashMap.newKeySet();
 	
 	public DebeziumTask(EventPublisher eventPublisher, ObjectProvider<SessionFactory> sessionFactoryProvider) {
 		this.eventPublisher = eventPublisher;
@@ -102,9 +103,10 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	public void stopEngine() throws IOException {
 		stopping.set(true);
 		stopLivenessMonitor();
-		if (this.debeziumEngine != null) {
+		DebeziumEngine<ChangeEvent<String, String>> engine = this.debeziumEngine;
+		if (engine != null) {
 			log.info("Stopping Embedded Debezium Engine...");
-			this.debeziumEngine.close();
+			engine.close();
 		}
 	}
 	
@@ -117,11 +119,15 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		if (tableName == null) {
 			return null;
 		}
-		
-		Class<?> entityClass = tableToEntityClassMap.get(tableName.toLowerCase(Locale.ROOT));
-		if (entityClass == null && sessionFactory != null) {
+
+		String key = tableName.toLowerCase(Locale.ROOT);
+		Class<?> entityClass = tableToEntityClassMap.get(key);
+		if (entityClass == null && sessionFactory != null && !unknownTables.contains(key)) {
 			refreshTableToEntityClassMap();
-			entityClass = tableToEntityClassMap.get(tableName.toLowerCase(Locale.ROOT));
+			entityClass = tableToEntityClassMap.get(key);
+			if (entityClass == null) {
+				unknownTables.add(key);
+			}
 		}
 		return entityClass;
 	}
@@ -134,7 +140,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		
 		String destination = event.destination();
 		String key = event.key();
-		log.debug("Received CDC event for table [{}]. Key: {}", destination, key);
+		log.debug("Received CDC event for table [{}].", destination);
 		
 		try {
 			JsonNode keyPayload = parsePayload(key);
@@ -157,27 +163,27 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 				} else if ("END".equals(status)) {
 					eventPublisher.publishEvent(new CDCTransactionCompletedEvent(txId));
 				}
-				resetFailedEventTracking();
+				clearFailedEventTracking(event);
 				return;
 			}
-			
+
 			if (payload.has("ddl")) {
 				log.debug("Schema Change Event detected and ignored. DDL: {}", payload.path("ddl").asText());
-				resetFailedEventTracking();
+				clearFailedEventTracking(event);
 				return;
 			}
-			
+
 			if (isHeartbeatEvent(payload)) {
 				log.trace("Heartbeat event detected and ignored for destination [{}]", destination);
-				resetFailedEventTracking();
+				clearFailedEventTracking(event);
 				return;
 			}
-			
+
 			String op = payload.path("op").asText(null);
 			if (op == null || op.isBlank()) {
 				throw new IllegalArgumentException("Missing CDC operation for destination [" + destination + "]");
 			}
-			
+
 			JsonNode before = payload.path("before");
 			JsonNode after = payload.path("after");
 			String txId = payload.path("transaction").path("id").asText(null);
@@ -190,11 +196,11 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 			if (!snapshotNode.isMissingNode() && !snapshotNode.isNull()) {
 				snapshot = snapshotNode.asText();
 			}
-			
+
 			Class<?> entityClass = getEntityClassByTableName(table);
 			log.debug("Parsed Event -> Operation: {}, Transaction ID: {}, Table: {}, Entity: {}, Snapshot: {}", op, txId, table, entityClass, snapshot);
 			log.trace("Parsed Event States -> Before: {}, After: {}", before, after);
-			
+
 			@SuppressWarnings("unchecked")
 			CDCEvent<Object> cdcEvent = new CDCEvent<>((Class<Object>) entityClass);
 			cdcEvent.setOperation(getOperation(op));
@@ -205,7 +211,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 			cdcEvent.setPreviousState(toMap(before));
 			cdcEvent.setNewState(toMap(after));
 			eventPublisher.publishEvent(cdcEvent);
-			resetFailedEventTracking();
+			clearFailedEventTracking(event);
 		}
 		catch (Exception e) {
 			handleEventFailure(event, key, e);
@@ -388,21 +394,25 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		return Long.toString(serverId);
 	}
 	
-	synchronized int registerFailedEventAttempt(ChangeEvent<String, String> event) {
-		String fingerprint = Objects.toString(event.destination(), "") + '\n' + Objects.toString(event.key(), "") + '\n'
-		        + Objects.toString(event.value(), "");
-		if (fingerprint.equals(lastFailedEventFingerprint)) {
-			lastFailedEventAttempts++;
-		} else {
-			lastFailedEventFingerprint = fingerprint;
-			lastFailedEventAttempts = 1;
-		}
-		return lastFailedEventAttempts;
+	int registerFailedEventAttempt(ChangeEvent<String, String> event) {
+		return failedEventAttempts.merge(extractStableFingerprint(event), 1, Integer::sum);
 	}
-	
-	synchronized void resetFailedEventTracking() {
-		lastFailedEventFingerprint = null;
-		lastFailedEventAttempts = 0;
+
+	static String extractStableFingerprint(ChangeEvent<String, String> event) {
+		String binlogPos = "";
+		if (event.value() != null) {
+			try {
+				JsonNode root = OBJECT_MAPPER.readTree(event.value());
+				JsonNode payload = root.has("payload") ? root.path("payload") : root;
+				JsonNode source = payload.path("source");
+				if (!source.isMissingNode()) {
+					binlogPos = source.path("file").asText("") + ':' + source.path("pos").asText("") + ':' + source.path("row").asText("");
+				}
+			}
+			catch (IOException ignored) {
+			}
+		}
+		return Objects.toString(event.destination(), "") + '\n' + Objects.toString(event.key(), "") + '\n' + binlogPos;
 	}
 	
 	int getFailedEventMaxRetries() {
@@ -452,7 +462,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		if (sessionFactory == null) {
 			return;
 		}
-		
+
 		try {
 			SessionFactoryImplementor sessionFactoryImplementor = sessionFactory.unwrap(SessionFactoryImplementor.class);
 			for (EntityPersister persister : sessionFactoryImplementor.getMetamodel().entityPersisters().values()) {
@@ -470,6 +480,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		catch (Exception e) {
 			log.warn("Failed to extract table mappings from SessionFactory", e);
 		}
+		unknownTables.removeAll(tableToEntityClassMap.keySet());
 	}
 	
 	private static @Nullable String cleanTableName(@Nullable String tableName) {
@@ -530,15 +541,22 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	}
 	
 	private void handleEventFailure(ChangeEvent<String, String> event, @Nullable String key, Exception error) {
-		int attempts = registerFailedEventAttempt(event);
+		String fingerprint = extractStableFingerprint(event);
+		int attempts = failedEventAttempts.merge(fingerprint, 1, Integer::sum);
 		if (attempts > getFailedEventMaxRetries()) {
 			parkFailedEvent(event, attempts, error);
+			failedEventAttempts.remove(fingerprint);
 			log.error("Parked CDC event for destination [{}] after {} failed attempts. Processing continues from the next event.", event.destination(), attempts, error);
-			resetFailedEventTracking();
 			return;
 		}
-		
-		throw new DebeziumException("Failed to parse and process CDC event for key [" + key + "]. Value: " + event.value(), error);
+
+		throw new DebeziumException("Failed to parse and process CDC event for destination [" + event.destination() + "]", error);
+	}
+
+	private void clearFailedEventTracking(ChangeEvent<String, String> event) {
+		if (!failedEventAttempts.isEmpty()) {
+			failedEventAttempts.remove(extractStableFingerprint(event));
+		}
 	}
 	
 	private void startLivenessMonitor(Properties debeziumConfig) {
@@ -556,11 +574,12 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		long checkIntervalMs = Math.max(heartbeatIntervalMs, 10000L);
 		livenessMonitor.scheduleAtFixedRate(() -> {
 			long lastActivity = lastEngineActivityTimestamp.get();
-			if (!stopping.get() && debeziumEngine != null && lastActivity > 0
+			DebeziumEngine<ChangeEvent<String, String>> engine = debeziumEngine;
+			if (!stopping.get() && engine != null && lastActivity > 0
 			        && System.currentTimeMillis() - lastActivity > heartbeatIntervalMs * LIVENESS_TIMEOUT_MULTIPLIER) {
 				log.error("Embedded Debezium Engine appears stalled. Closing it so the scheduler can re-run on a healthy instance.");
 				try {
-					debeziumEngine.close();
+					engine.close();
 				}
 				catch (IOException e) {
 					log.error("Failed to stop stalled Embedded Debezium Engine", e);

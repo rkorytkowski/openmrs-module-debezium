@@ -33,6 +33,7 @@ import java.util.Map;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.atMost;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -115,6 +116,20 @@ public class DebeziumTaskMockTest {
 	}
 	
 	@Test
+	public void getEntityClassByTableName_shouldNotRescanForEveryEventFromUnknownTables() {
+		// Two unknown tables interleaving (the jobrunr_* case)
+		debeziumTask.getEntityClassByTableName("jobrunr_jobs");
+		debeziumTask.getEntityClassByTableName("jobrunr_backgroundjobservers");
+		debeziumTask.getEntityClassByTableName("jobrunr_jobs");
+		debeziumTask.getEntityClassByTableName("jobrunr_backgroundjobservers");
+		debeziumTask.getEntityClassByTableName("jobrunr_jobs");
+		debeziumTask.getEntityClassByTableName("jobrunr_backgroundjobservers");
+		
+		// 1 from @PostConstruct init + 1 per unknown table = 3 total
+		verify(sessionFactory, atMost(3)).unwrap(SessionFactoryImplementor.class);
+	}
+	
+	@Test
 	public void parseDatabaseConnectionInfo_shouldUseFirstHostAndExtractDatabaseName() {
 		DebeziumTask.DatabaseConnectionInfo info = DebeziumTask
 		        .parseDatabaseConnectionInfo("jdbc:mysql:replication://db-primary:3307,db-secondary:3307/custom_openmrs?useSSL=false");
@@ -129,7 +144,77 @@ public class DebeziumTaskMockTest {
 	public void parseDatabaseConnectionInfo_shouldFailLoudlyWhenDatabaseNameIsMissing() {
 		IllegalStateException error = assertThrows(IllegalStateException.class,
 		    () -> DebeziumTask.parseDatabaseConnectionInfo("jdbc:mariadb://db-primary:3306"));
-		
+
 		Assert.assertTrue(error.getMessage().contains("database name"));
+	}
+	
+	@Test
+	public void registerFailedEventAttempt_shouldIncrementCountAcrossCallsForSameEvent() {
+		ChangeEvent<String, String> event = mockEventWithBinlogPos("openmrs.openmrs.person_name", "{\"person_name_id\":99}",
+		    "binlog.001", "500", "0");
+		
+		assertEquals(1, debeziumTask.registerFailedEventAttempt(event));
+		assertEquals(2, debeziumTask.registerFailedEventAttempt(event));
+		assertEquals(3, debeziumTask.registerFailedEventAttempt(event));
+	}
+	
+	@Test
+	public void registerFailedEventAttempt_shouldNotResetWhenTimestampChangesAcrossRestarts() {
+		String valueTemplate = "{\"source\":{\"file\":\"binlog.001\",\"pos\":300,\"row\":0},\"op\":\"u\",\"ts_ms\":%d}";
+		
+		ChangeEvent<String, String> attempt1 = mock(ChangeEvent.class);
+		when(attempt1.destination()).thenReturn("openmrs.openmrs.person_name");
+		when(attempt1.key()).thenReturn("{\"person_name_id\":77}");
+		when(attempt1.value()).thenReturn(String.format(valueTemplate, 1000L));
+		
+		ChangeEvent<String, String> attempt2 = mock(ChangeEvent.class);
+		when(attempt2.destination()).thenReturn("openmrs.openmrs.person_name");
+		when(attempt2.key()).thenReturn("{\"person_name_id\":77}");
+		when(attempt2.value()).thenReturn(String.format(valueTemplate, 2000L));
+		
+		assertEquals(1, debeziumTask.registerFailedEventAttempt(attempt1));
+		assertEquals(2, debeziumTask.registerFailedEventAttempt(attempt2));
+	}
+	
+	@Test
+	public void handleEvent_shouldNotResetPoisonEventCounterWhenDifferentEventSucceeds() throws Exception {
+		ChangeEvent<String, String> poisonEvent = mockEventWithBinlogPos("openmrs.openmrs.person_name",
+		    "{\"person_name_id\":1}", "binlog.001", "100", "0");
+		ChangeEvent<String, String> otherEvent = mockEventWithBinlogPos("openmrs.openmrs.person_name",
+		    "{\"person_name_id\":2}", "binlog.001", "200", "0");
+		when(otherEvent.value()).thenReturn(buildUpdatePayload("binlog.001", "200", "0"));
+		
+		assertEquals(1, debeziumTask.registerFailedEventAttempt(poisonEvent));
+		debeziumTask.handleEvent(otherEvent); // different event succeeds
+		assertEquals(2, debeziumTask.registerFailedEventAttempt(poisonEvent)); // poison counter unchanged
+	}
+	
+	@Test
+	public void handleEvent_shouldResetCounterWhenSameEventSucceeds() throws Exception {
+		ChangeEvent<String, String> event = mock(ChangeEvent.class);
+		when(event.destination()).thenReturn("openmrs.openmrs.person_name");
+		when(event.key()).thenReturn("{\"person_name_id\":3}");
+		when(event.value()).thenReturn(buildUpdatePayload("binlog.001", "300", "0"));
+		
+		assertEquals(1, debeziumTask.registerFailedEventAttempt(event));
+		debeziumTask.handleEvent(event); // event now succeeds
+		assertEquals(1, debeziumTask.registerFailedEventAttempt(event)); // counter reset to 1
+	}
+	
+	@SuppressWarnings("unchecked")
+	private static ChangeEvent<String, String> mockEventWithBinlogPos(String destination, String key, String file,
+	        String pos, String row) {
+		ChangeEvent<String, String> event = mock(ChangeEvent.class);
+		when(event.destination()).thenReturn(destination);
+		when(event.key()).thenReturn(key);
+		when(event.value()).thenReturn(buildUpdatePayload(file, pos, row));
+		return event;
+	}
+	
+	private static String buildUpdatePayload(String file, String pos, String row) {
+		return "{\"before\":{\"person_name_id\":1,\"given_name\":\"John\",\"family_name\":\"Doe\",\"uuid\":\"u1\"},"
+		        + "\"after\":{\"person_name_id\":1,\"given_name\":\"Jane\",\"family_name\":\"Doe\",\"uuid\":\"u1\"},"
+		        + "\"source\":{\"table\":\"person_name\",\"file\":\"" + file + "\",\"pos\":" + pos + ",\"row\":" + row
+		        + "}," + "\"op\":\"u\",\"transaction\":{\"id\":\"tx-1\"}}";
 	}
 }
