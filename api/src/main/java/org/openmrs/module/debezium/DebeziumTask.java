@@ -37,6 +37,8 @@ import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -229,6 +231,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		}
 		log.info("Instance elected to run Embedded Debezium Engine. Starting up...");
 		stopping.set(false);
+		unregisterDebeziumMBeans();
 		
 		AtomicReference<Throwable> engineError = new AtomicReference<>();
 		Properties debeziumConfig = getDebeziumConfig();
@@ -511,6 +514,24 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 
 	private Connection openDbConnection() throws SQLException {
 		return DriverManager.getConnection(getDbUrl(), getDbUsername(), getDbPassword());
+	}
+
+	private void unregisterDebeziumMBeans() {
+		MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+		try {
+			for (ObjectName mbean : mBeanServer.queryNames(new ObjectName("debezium.*:*"), null)) {
+				try {
+					mBeanServer.unregisterMBean(mbean);
+					log.debug("Unregistered stale Debezium MBean: {}", mbean);
+				}
+				catch (Exception e) {
+					log.debug("Could not unregister Debezium MBean {}", mbean, e);
+				}
+			}
+		}
+		catch (Exception e) {
+			log.debug("Could not query Debezium MBeans for cleanup", e);
+		}
 	}
 
 	private synchronized void refreshTableToEntityClassMap() {
