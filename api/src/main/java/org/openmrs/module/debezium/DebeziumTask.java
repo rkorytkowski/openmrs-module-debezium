@@ -224,6 +224,9 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		if (!checkBinlogFormat()) {
 			return;
 		}
+		if (!checkBinlogPrivilege()) {
+			return;
+		}
 		log.info("Instance elected to run Embedded Debezium Engine. Starting up...");
 		stopping.set(false);
 		
@@ -266,13 +269,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	}
 	
 	boolean checkBinlogFormat() {
-		Properties runtimeProperties = Context.getRuntimeProperties();
-		String dbUrl = runtimeProperties.getProperty("connection.url");
-		String dbUsername = runtimeProperties.getProperty("debezium.database.user",
-		    runtimeProperties.getProperty("connection.username"));
-		String dbPassword = runtimeProperties.getProperty("debezium.database.password",
-		    runtimeProperties.getProperty("connection.password"));
-		try (Connection connection = DriverManager.getConnection(dbUrl, dbUsername, dbPassword);
+		try (Connection connection = openDbConnection();
 		     Statement statement = connection.createStatement();
 		     ResultSet rs = statement.executeQuery("SHOW VARIABLES LIKE 'binlog_format'")) {
 			if (rs.next()) {
@@ -295,18 +292,29 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		return true;
 	}
 
+	boolean checkBinlogPrivilege() {
+		try (Connection connection = openDbConnection();
+		     Statement statement = connection.createStatement()) {
+			statement.executeQuery("SHOW BINARY LOGS");
+		}
+		catch (SQLException e) {
+			if (e.getMessage() != null && e.getMessage().contains("Access denied")) {
+				log.warn("Debezium CDC connector requires the SUPER or BINLOG MONITOR privilege but user '{}' was denied. "
+				        + "Grant 'BINLOG MONITOR' (MariaDB) or 'REPLICATION CLIENT' (MySQL) to the database user and restart OpenMRS.",
+				    getDbUsername());
+			} else {
+				log.warn("Failed to verify BINLOG MONITOR privilege prerequisite for Debezium CDC", e);
+			}
+			return false;
+		}
+		return true;
+	}
+
 	public Properties getDebeziumConfig() {
-		Properties runtimeProperties = Context.getRuntimeProperties();
-		String dbUrl = runtimeProperties.getProperty("connection.url");
-		String dbUsername = runtimeProperties.getProperty("debezium.database.user");
-		if (dbUsername == null) {
-			dbUsername = runtimeProperties.getProperty("connection.username");
-		}
-		String dbPassword = runtimeProperties.getProperty("debezium.database.password");
-		if (dbPassword == null) {
-			dbPassword = runtimeProperties.getProperty("connection.password");
-		}
-		
+		String dbUrl = getDbUrl();
+		String dbUsername = getDbUsername();
+		String dbPassword = getDbPassword();
+
 		DatabaseConnectionInfo connectionInfo = parseDatabaseConnectionInfo(dbUrl);
 		Properties debeziumConfig = io.debezium.config.Configuration.create()
 		        .with("name", "openmrs-debezium-engine")
@@ -346,6 +354,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		        .asProperties();
 		Properties properties = new Properties();
 		properties.putAll(debeziumConfig);
+		Properties runtimeProperties = Context.getRuntimeProperties();
 		for (String key : runtimeProperties.stringPropertyNames()) {
 			if (key.startsWith("debezium.") && !key.startsWith("debezium.module.")) {
 				String debeziumKey = key.substring("debezium.".length());
@@ -467,12 +476,7 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 	}
 	
 	void parkFailedEvent(ChangeEvent<String, String> event, int attempts, Exception error) {
-		Properties runtimeProperties = Context.getRuntimeProperties();
-		String dbUrl = runtimeProperties.getProperty("connection.url");
-		String dbUsername = runtimeProperties.getProperty("debezium.database.user", runtimeProperties.getProperty("connection.username"));
-		String dbPassword = runtimeProperties.getProperty("debezium.database.password", runtimeProperties.getProperty("connection.password"));
-		
-		try (Connection connection = DriverManager.getConnection(dbUrl, dbUsername, dbPassword);
+		try (Connection connection = openDbConnection();
 		     Statement createTableStatement = connection.createStatement()) {
 			createTableStatement.execute("CREATE TABLE IF NOT EXISTS " + FAILED_EVENTS_TABLE
 			        + " (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, destination VARCHAR(255) NOT NULL, event_key MEDIUMTEXT NULL, event_value LONGTEXT NOT NULL, attempts INT NOT NULL, error_message TEXT NOT NULL, failed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
@@ -491,6 +495,24 @@ public class DebeziumTask implements TaskHandler<DebeziumTaskData> {
 		}
 	}
 	
+	private String getDbUrl() {
+		return Context.getRuntimeProperties().getProperty("connection.url");
+	}
+
+	private String getDbUsername() {
+		Properties p = Context.getRuntimeProperties();
+		return p.getProperty("debezium.database.user", p.getProperty("connection.username"));
+	}
+
+	private String getDbPassword() {
+		Properties p = Context.getRuntimeProperties();
+		return p.getProperty("debezium.database.password", p.getProperty("connection.password"));
+	}
+
+	private Connection openDbConnection() throws SQLException {
+		return DriverManager.getConnection(getDbUrl(), getDbUsername(), getDbPassword());
+	}
+
 	private synchronized void refreshTableToEntityClassMap() {
 		tableToEntityClassMap.clear();
 		if (sessionFactory == null) {
